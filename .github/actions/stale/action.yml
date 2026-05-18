@@ -55,8 +55,10 @@ runs:
 
           **Is this issue still relevant to you?**
 
-          - If **yes**, please leave a short comment below (you or anyone else) to confirm that it's still relevant. We'll then remove the "stale" label and keep the issue open.
+          - If **yes**, please verify that the issue is **still reproducible on a [currently supported version of PrestaShop](https://github.com/PrestaShop/PrestaShop/releases)**, then leave a short comment below to confirm it's still relevant. We'll then remove the "stale" label and keep the issue open.
           - If we don't hear back, we'll assume the issue is no longer needed. **A grace period of ${{ inputs.days-before-close }} days** will apply from this message. After that, the issue will be **automatically closed**.
+
+          > ⚠️ **Prerequisite:** Before confirming, please make sure the bug is still reproducible on a **[currently supported version of PrestaShop](https://github.com/PrestaShop/PrestaShop/releases)**. Issues that cannot be reproduced on a supported version will not be kept open.
 
           We appreciate your contribution and understanding. 🙏
 
