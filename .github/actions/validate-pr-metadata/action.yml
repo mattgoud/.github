@@ -26,16 +26,32 @@ runs:
         set -e
 
         EVENT_JSON=$(cat "$GITHUB_EVENT_PATH")
-        TITLE=$(echo "$EVENT_JSON" | jq -r '.pull_request.title // ""')
-        BODY=$(echo "$EVENT_JSON" | jq -r '.pull_request.body // ""')
-        if [ -z "$BODY" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
-          PR_NUM=$(echo "$EVENT_JSON" | jq -r '.pull_request.number')
-          REPO=$(echo "$EVENT_JSON" | jq -r '.repository.full_name')
-          BODY=$(curl -sS -f -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO}/pulls/${PR_NUM}" | jq -r '.body // ""') || true
+        PR_NUM=$(echo "$EVENT_JSON" | jq -r '.pull_request.number // empty')
+        REPO=$(echo "$EVENT_JSON" | jq -r '.repository.full_name // empty')
+
+        # Fetch the PR live from the API so reruns pick up edits made after the
+        # triggering event. Fall back to the event payload if the API call fails
+        # (e.g. missing GITHUB_TOKEN).
+        PR_JSON=""
+        if [ -n "$PR_NUM" ] && [ -n "$REPO" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+          PR_JSON=$(curl -sS -f -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUM}") || PR_JSON=""
+        fi
+
+        if [ -n "$PR_JSON" ]; then
+          echo "Using live PR data from the GitHub API."
+          TITLE=$(echo "$PR_JSON" | jq -r '.title // ""')
+          BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
+          AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login // ""')
+          MILESTONE=$(echo "$PR_JSON" | jq -r '.milestone.title // ""')
+        else
+          echo "Falling back to event payload (no token or API call failed)."
+          TITLE=$(echo "$EVENT_JSON" | jq -r '.pull_request.title // ""')
+          BODY=$(echo "$EVENT_JSON" | jq -r '.pull_request.body // ""')
+          AUTHOR=$(echo "$EVENT_JSON" | jq -r '.pull_request.user.login // ""')
+          MILESTONE=$(echo "$EVENT_JSON" | jq -r '.pull_request.milestone.title // ""')
         fi
         BODY="${BODY//$'\r'/}"
-        AUTHOR=$(echo "$EVENT_JSON" | jq -r '.pull_request.user.login // ""')
-        MILESTONE=$(echo "$EVENT_JSON" | jq -r '.pull_request.milestone.title // ""')
 
         IFS=',' read -ra CAT_ARR <<< "$ACCEPTED_CATEGORIES"
         ACCEPTED_CATEGORIES_NORM=""
@@ -65,9 +81,16 @@ runs:
 
         ERRORS=()
 
+        # Markdown table rows may legitimately end with a trailing "|". With
+        # `awk -F'|' '{print $NF}'` that turns into an empty last field, so we
+        # strip the trailing pipe (and surrounding whitespace) before parsing.
+        strip_trailing_pipe() {
+          sed 's/[[:space:]]*|[[:space:]]*$//'
+        }
+
         validate_category() {
           local line cat
-          line=$(echo "$BODY" | grep -i "Category?" | head -1 || true)
+          line=$(echo "$BODY" | grep -i "Category?" | head -1 | strip_trailing_pipe || true)
           cat=""
           [ -n "$line" ] && cat=$(echo "$line" | awk -F'|' '{print $NF}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')
           if [ -z "$cat" ] || [[ " $ACCEPTED_CATEGORIES_NORM" != *" $cat "* ]]; then
@@ -77,7 +100,7 @@ runs:
 
         validate_type() {
           local line typ
-          line=$(echo "$BODY" | grep -i "Type?" | head -1 || true)
+          line=$(echo "$BODY" | grep -i "Type?" | head -1 | strip_trailing_pipe || true)
           typ=""
           [ -n "$line" ] && typ=$(echo "$line" | awk -F'|' '{print $NF}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r' | tr '[:upper:]' '[:lower:]')
           if [ -z "$typ" ] || [[ " $ACCEPTED_TYPES_NORM" != *" $typ "* ]]; then
