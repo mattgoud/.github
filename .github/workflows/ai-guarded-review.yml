@@ -191,7 +191,6 @@ jobs:
 
       - name: Run Claude review
         id: claude
-        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.anthropic-api-key }}
@@ -199,13 +198,32 @@ jobs:
           claude_args: '--model ${{ inputs.claude-model }} --max-turns ${{ inputs.max-turns }} --allowedTools "${{ inputs.allowed-tools }}"'
           prompt: ${{ inputs.prompt }}
 
+      # Runs even when the review step failed (if: always()) so it can produce
+      # the execution report and double-check the output. The Claude step now
+      # fails the job natively on an SDK/API error; this step still surfaces
+      # problems the action itself does not flag (permission denials, is_error
+      # results) and re-confirms the failure for clarity.
       - name: Validate Claude execution
+        if: always()
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
           STEP_OUTCOME: ${{ steps.claude.outcome }}
         run: |
+          # When the review step fails it often does not export the
+          # execution_file output, even though the action still wrote the log to
+          # the runner temp dir. Fall back to that known location so a failed run
+          # can still be parsed and reported on (the hard-fail happens later,
+          # after the report — not here).
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            EXECUTION_FILE="${RUNNER_TEMP}/claude-execution-output.json"
+          fi
+          # Only exit early when there is genuinely nothing on disk to analyze.
           if [ ! -f "$EXECUTION_FILE" ]; then
-            echo "::error::Claude execution output file not found."
+            if [ "$STEP_OUTCOME" = "failure" ]; then
+              echo "::error::The Claude review action failed (outcome=failure) and produced no execution output file. This usually indicates an early SDK/API error such as an exhausted credit balance, invalid API key, or network failure."
+            else
+              echo "::error::Claude execution output file not found."
+            fi
             exit 1
           fi
           # The execution file can be a JSON array (conversation log) or a single object.
@@ -224,25 +242,48 @@ jobs:
           echo "## Claude execution report" >> "$GITHUB_STEP_SUMMARY"
           echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Action outcome | $STEP_OUTCOME |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Status | $SUBTYPE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Turns used | $NUM_TURNS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Permission denials | $DENIALS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Cost | \$${COST} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Error | $IS_ERROR |" >> "$GITHUB_STEP_SUMMARY"
           FAILED=false
+          # Re-confirm the action's own failure for clarity. The job already
+          # fails natively when this step's outcome is "failure", but surfacing
+          # it here keeps the report accurate. Note: such errors can report
+          # subtype="success" while is_error=true, so STEP_OUTCOME and is_error
+          # — not subtype — are the reliable signals.
+          if [ "$STEP_OUTCOME" = "failure" ]; then
+            echo "::error::The Claude review action failed (outcome=failure, subtype=$SUBTYPE, is_error=$IS_ERROR). This usually indicates an SDK/API error such as an exhausted credit balance, invalid API key, or network failure."
+            FAILED=true
+          fi
           if [ "$DENIALS" -gt 0 ] && [ "$DENIALS" -ge "$NUM_TURNS" ]; then
             echo "::error::Claude was denied permissions on almost every turn ($DENIALS/$NUM_TURNS). Check allowed_tools configuration."
             FAILED=true
           fi
+          # Reaching max turns is the one tolerated error: a partial review may
+          # have been posted, so warn but do not fail.
           if [ "$SUBTYPE" = "error_max_turns" ]; then
             echo "::warning::Claude reached the maximum number of turns ($NUM_TURNS). The review may be incomplete."
+          elif [ "$IS_ERROR" = "true" ]; then
+            echo "::error::Claude reported an error result (subtype=$SUBTYPE). No valid review was produced."
+            FAILED=true
           fi
-          if [ "$IS_ERROR" = "true" ] && [ "$FAILED" = "true" ]; then
+          if [ "$FAILED" = "true" ]; then
             exit 1
           fi
-          if [ "$IS_ERROR" = "true" ]; then
-            echo "::warning::Claude reported an error ($SUBTYPE) but may have posted partial results."
-          fi
+
+      # If any step above failed (review errored, validation caught a problem),
+      # remove the trigger label so a reviewer can re-add it to relaunch the
+      # review later — mirroring the guard-failed cleanup.
+      - name: Remove trigger label on failure
+        if: failure()
+        run: |
+          gh pr edit "$PR_NUMBER" --repo "${{ inputs.repository }}" \
+            --remove-label "${{ inputs.trigger-label }}"
+          echo "::warning::Claude review did not complete — removed the '${{ inputs.trigger-label }}' label. Re-add it to relaunch the review."
+          echo "⚠️ Claude review did not complete — label '${{ inputs.trigger-label }}' removed. Re-add it to retry." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update labels
         run: |
