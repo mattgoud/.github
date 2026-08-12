@@ -20,6 +20,10 @@ inputs:
     description: 'GitHub repository (owner/repo). Defaults to the current repository.'
     required: false
     default: ${{ github.repository }}
+  fallback_repository:
+    description: 'Fallback repository (owner/repo) used to resolve PRs not found in `repository`, e.g. when running on a private mirror whose history references upstream PRs. When set, `repository` is considered private and its address is never used in generated URLs. Empty or equal to `repository` = disabled.'
+    required: false
+    default: ''
   github_token:
     description: 'GitHub token for API access'
     required: true
@@ -54,4 +58,5 @@ runs:
         NEXT_VERSION: ${{ inputs.next_version }}
         RELEASE_DATE: ${{ inputs.release_date }}
         GH_REPOSITORY: ${{ inputs.repository }}
+        FALLBACK_REPOSITORY: ${{ inputs.fallback_repository }}
       run: bash ${{ github.action_path }}/../../scripts/generate-changelog.sh

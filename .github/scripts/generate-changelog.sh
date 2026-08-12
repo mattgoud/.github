@@ -11,12 +11,18 @@ set -euo pipefail
 #   NEXT_VERSION      - New version string (e.g. 9.1.0 Beta 1)
 #   RELEASE_DATE      - Date for the new release (YYYY-MM-DD), default: today
 #   GH_REPOSITORY     - owner/repo
+#   FALLBACK_REPOSITORY - optional owner/repo used to resolve PRs not found in GH_REPOSITORY
+#                         (e.g. when GH_REPOSITORY is a private mirror whose history references
+#                         PRs merged in the upstream repository)
 
 PREVIOUS_REF="${PREVIOUS_REF:?PREVIOUS_REF is required}"
 TARGET_REF="${TARGET_REF:-HEAD}"
 NEXT_VERSION="${NEXT_VERSION:?NEXT_VERSION is required}"
 RELEASE_DATE="${RELEASE_DATE:-$(date +%Y-%m-%d)}"
 REPO="${GH_REPOSITORY:?GH_REPOSITORY is required}"
+FALLBACK_REPO="${FALLBACK_REPOSITORY:-}"
+# No fallback needed when it points to the repository itself
+[[ "$FALLBACK_REPO" == "$REPO" ]] && FALLBACK_REPO=""
 
 # -----------------------------------------------------------------------------
 # Map Category code (template) -> Changelog section name
@@ -91,14 +97,25 @@ if [[ -z "$PR_NUMBERS" ]]; then
   PRS_JSON="[]"
   PR_COUNT=0
 else
-  # Build PRS_JSON array by fetching title+author for each PR from the API
+  # Build PRS_JSON array by fetching title+author for each PR from the API.
+  # PRs are searched in REPO first, then in FALLBACK_REPO (if configured); each entry
+  # keeps track of the repository it was resolved in (used for API calls and URLs).
   PRS_JSON="[]"
   for number in $PR_NUMBERS; do
-    pr_info=$(gh pr view "$number" --repo "$REPO" --json number,title,author -q '.' 2>/dev/null || echo '')
+    pr_repo="$REPO"
+    pr_info=$(gh pr view "$number" --repo "$pr_repo" --json number,title,author -q '.' 2>/dev/null || echo '')
+    if [[ -z "$pr_info" && -n "$FALLBACK_REPO" ]]; then
+      pr_repo="$FALLBACK_REPO"
+      pr_info=$(gh pr view "$number" --repo "$pr_repo" --json number,title,author -q '.' 2>/dev/null || echo '')
+    fi
     if [[ -n "$pr_info" ]]; then
-      PRS_JSON=$(echo "$PRS_JSON" | jq --argjson pr "$pr_info" '. + [$pr]')
+      PRS_JSON=$(echo "$PRS_JSON" | jq --argjson pr "$pr_info" --arg repo "$pr_repo" '. + [$pr + {repo: $repo}]')
     else
-      echo "::error::Could not fetch PR #${number}." >&2
+      if [[ -n "$FALLBACK_REPO" ]]; then
+        echo "::error::Could not fetch PR #${number} (searched in ${REPO} and ${FALLBACK_REPO})." >&2
+      else
+        echo "::error::Could not fetch PR #${number}." >&2
+      fi
       exit 1
     fi
   done
@@ -126,7 +143,8 @@ while read -r pr; do
 
   title=$(echo "$pr" | jq -r '.title | gsub("\n"; " ")')
   author=$(echo "$pr" | jq -r '.author.login')
-  pr_data=$(gh pr view "$number" --repo "$REPO" --json body,milestone -q '.' 2>/dev/null || echo '{}')
+  pr_repo=$(echo "$pr" | jq -r '.repo')
+  pr_data=$(gh pr view "$number" --repo "$pr_repo" --json body,milestone -q '.' 2>/dev/null || echo '{}')
   body=$(echo "$pr_data" | jq -r '.body // ""')
   milestone=$(echo "$pr_data" | jq -r '.milestone.title // ""')
 
@@ -145,14 +163,20 @@ while read -r pr; do
   [[ -z "$milestone" || "$milestone" == "null" ]] && reasons+=("Milestone is empty")
 
   if [[ ${#reasons[@]} -gt 0 ]]; then
-    echo "#${number}" >> "$ERRORS_FILE"
+    echo "#${number}|${pr_repo}" >> "$ERRORS_FILE"
     echo "$title" >> "$ERRORS_FILE"
     for r in "${reasons[@]}"; do echo "$r" >> "$ERRORS_FILE"; done
     echo "---" >> "$ERRORS_FILE"
   fi
 
   line="    - #${number}: ${title} (by @${author})"
-  formatted_line="    - [#${number}](https://github.com/${REPO}/pull/${number}): ${title} (by [@${author}](https://github.com/${author}))"
+  # When a fallback repository is configured, REPO is a private mirror: its address must
+  # never appear in the generated changelog, so PRs resolved in it are not linked.
+  if [[ -n "$FALLBACK_REPO" && "$pr_repo" == "$REPO" ]]; then
+    formatted_line="    - #${number}: ${title} (by [@${author}](https://github.com/${author}))"
+  else
+    formatted_line="    - [#${number}](https://github.com/${pr_repo}/pull/${number}): ${title} (by [@${author}](https://github.com/${author}))"
+  fi
   echo "${category_name}|${type_name}|${line}" >> "$CATEGORIZED_FILE"
   echo "${category_name}|${type_name}|${formatted_line}" >> "$CATEGORIZED_FORMATTED_FILE"
 done < <(echo "$PRS_JSON" | jq -c 'sort_by(-.number) | .[]')
@@ -168,9 +192,11 @@ if [[ -s "$ERRORS_FILE" ]]; then
   echo "PRs in error:" >&2
   while IFS= read -r err_line; do
     if [[ "$err_line" == \#* ]]; then
-      num="${err_line#\#}"
+      num_and_repo="${err_line#\#}"
+      num="${num_and_repo%%|*}"
+      err_repo="${num_and_repo##*|}"
       read -r tit || true
-      echo "::error:: #${num}: ${tit}  (https://github.com/${REPO}/pull/${num})" >&2
+      echo "::error:: #${num}: ${tit}  (https://github.com/${err_repo}/pull/${num})" >&2
       while IFS= read -r reason_line; do
         [[ "$reason_line" == "---" ]] && break
         echo "  • $reason_line" >&2
@@ -379,10 +405,10 @@ FIRST_TIME_CONTRIBUTORS_PAIRS=$(echo "$FIRST_TIME_CONTRIBUTORS_PAIRS" | sed '/^$
 CONTRIBUTORS_CSV=$(echo "$NEW_CONTRIBUTORS_PAIRS" | paste -sd ',' - | sed 's/,/, /g')
 NEW_CONTRIBUTORS_CSV=$(echo "$FIRST_TIME_CONTRIBUTORS_PAIRS" | paste -sd ',' - | sed 's/,/, /g')
 
-CONTRIBUTORS_GRID_INNER=$(echo "$NEW_CONTRIBUTOR_LOGINS" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd ' ')
+CONTRIBUTORS_GRID_INNER=$(echo "$NEW_CONTRIBUTOR_LOGINS" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd ' ' -)
 CONTRIBUTORS_GRID="{{< contributors-grid ${CONTRIBUTORS_GRID_INNER} / >}}"
 
-NEW_CONTRIBUTORS_GRID_INNER=$(echo "$FIRST_TIME_LOGINS" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd ' ')
+NEW_CONTRIBUTORS_GRID_INNER=$(echo "$FIRST_TIME_LOGINS" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd ' ' -)
 NEW_CONTRIBUTORS_GRID="{{< contributors-grid ${NEW_CONTRIBUTORS_GRID_INNER} / >}}"
 
 # -----------------------------------------------------------------------------
