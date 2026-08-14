@@ -41,7 +41,7 @@ on:
       max-turns:
         required: false
         type: number
-        default: 30
+        default: 40
         description: "Maximum number of turns for Claude"
       allowed-tools:
         required: false
@@ -189,6 +189,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Snapshot the time just before Claude runs. The review comment is posted by
+      # Claude itself (via `gh pr comment`), so "a comment exists that is newer than
+      # this" is how the verification step below proves a review was actually posted.
+      - name: Record review start time
+        run: echo "REVIEW_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - name: Run Claude review
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -274,9 +280,29 @@ jobs:
             exit 1
           fi
 
-      # If any step above failed (review errored, validation caught a problem),
-      # remove the trigger label so a reviewer can re-add it to relaunch the
-      # review later — mirroring the guard-failed cleanup.
+      # The review comment is posted by Claude itself via `gh pr comment`, within the
+      # --max-turns budget. On a large PR Claude can exhaust that budget before it ever
+      # comments, which surfaces as `error_max_turns` — tolerated above as a warning.
+      # Without this check the job would still succeed and apply the reviewed label with
+      # no review posted at all. Confirm a bot comment was actually created/updated during
+      # this run; if not, fail so the failure-cleanup below restores the trigger label
+      # instead of silently marking the PR reviewed.
+      - name: Verify a review comment was posted
+        env:
+          REPO: ${{ inputs.repository }}
+        run: |
+          LATEST=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | max_by(.updated_at) | .updated_at // ""')
+          if [ -z "$LATEST" ] || [[ "$LATEST" < "$REVIEW_STARTED_AT" ]]; then
+            echo "::error::No review comment was posted during this run (latest bot comment: '${LATEST:-none}', run started: $REVIEW_STARTED_AT). Claude likely reached --max-turns before commenting. Failing so the '${{ inputs.trigger-label }}' label is restored instead of marking the PR reviewed."
+            echo "⛔ No review comment was posted — not marking the PR as reviewed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "✅ Review comment confirmed (posted/updated at $LATEST)." >> "$GITHUB_STEP_SUMMARY"
+
+      # If any step above failed (review errored, validation caught a problem,
+      # or no comment was posted), remove the trigger label so a reviewer can
+      # re-add it to relaunch the review later — mirroring the guard-failed cleanup.
       - name: Remove trigger label on failure
         if: failure()
         run: |
