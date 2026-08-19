@@ -1,0 +1,88 @@
+name: 'Team membership guard'
+description: >-
+  Checks that a GitHub user is an active member of an organization team.
+  By default the step fails when the user is not a member, which blocks all
+  dependent jobs/steps. Set require_membership to false to only expose the
+  result as an output and let the caller decide what to do.
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  team_slug:
+    description: 'Slug of the team the actor must belong to (e.g. prestashop-sa)'
+    required: true
+  token:
+    description: 'Token with read:org scope used for the membership API call (e.g. JARVIS_TOKEN)'
+    required: true
+  actor:
+    description: 'GitHub login to verify. Defaults to the user who triggered the workflow.'
+    required: false
+    default: ''
+  org:
+    description: 'Organization owning the team. Defaults to the owner of the calling repository.'
+    required: false
+    default: ''
+  require_membership:
+    description: 'When true (default), the step fails if the actor is not an active team member. Set to false to only expose the is_member output.'
+    required: false
+    default: 'true'
+
+outputs:
+  is_member:
+    description: '"true" when the actor is an active member of the team, "false" otherwise'
+    value: ${{ steps.check.outputs.is_member }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check team membership
+      id: check
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        ACTOR: ${{ inputs.actor || github.actor }}
+        TEAM: ${{ inputs.team_slug }}
+        ORG: ${{ inputs.org || github.repository_owner }}
+        REQUIRE: ${{ inputs.require_membership }}
+      run: |
+        fail_or_report() {
+          echo "is_member=false" >> "$GITHUB_OUTPUT"
+          if [ "$REQUIRE" = "true" ]; then
+            exit 1
+          fi
+          exit 0
+        }
+
+        if [ -z "$TOKEN" ]; then
+          echo "::error::The token input is empty — the secret may not be configured or not accessible from the calling repository. It must be a token with read:org scope."
+          echo "⛔ Team guard: token is empty, cannot check membership." >> "$GITHUB_STEP_SUMMARY"
+          fail_or_report
+        fi
+
+        API_URL="https://api.github.com/orgs/${ORG}/teams/${TEAM}/memberships/${ACTOR}"
+        echo "Checking membership: ${API_URL}"
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "$API_URL")
+        STATUS=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$STATUS" = "200" ]; then
+          ROLE=$(echo "$BODY" | jq -r '.role // "unknown"')
+          STATE=$(echo "$BODY" | jq -r '.state // "unknown"')
+          if [ "$STATE" = "active" ]; then
+            echo "is_member=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ${ACTOR} is a member of ${ORG}/${TEAM} (role=${ROLE}, state=${STATE})." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::${ACTOR} has a pending (state=${STATE}) membership in ${ORG}/${TEAM} — only active members are allowed."
+          echo "⛔ ${ACTOR} is not an active member of ${ORG}/${TEAM} (state=${STATE})." >> "$GITHUB_STEP_SUMMARY"
+          fail_or_report
+        fi
+
+        echo "::error::${ACTOR} is not a member of ${ORG}/${TEAM} (HTTP ${STATUS})."
+        echo "⛔ ${ACTOR} is not a member of ${ORG}/${TEAM} (HTTP ${STATUS})." >> "$GITHUB_STEP_SUMMARY"
+        fail_or_report
